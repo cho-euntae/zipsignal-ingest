@@ -30,6 +30,9 @@ const args = process.argv.slice(2);
 const isLocal = args.includes("--local");
 const dbFlag = isLocal ? "--local" : "--remote";
 const ymArg = args.find((a) => a.startsWith("--ym="))?.split("=")[1];
+// --only=41192,41194 : 특정 시군구(lawd_cd)만 수집 (재수집/보정용). 생략 시 전체.
+const onlyArg = args.find((a) => a.startsWith("--only="))?.split("=")[1];
+const onlyCodes = onlyArg ? new Set(onlyArg.split(",").map((s) => s.trim())) : null;
 
 const API_KEY = process.env.DATA_GO_KR_API_KEY;
 if (!API_KEY) {
@@ -242,10 +245,17 @@ function rowsToSql(rows, lawdCd, ym) {
 // ---------- 메인 ----------
 async function main() {
   const months = ymArg ? [ymArg] : [ymOffset(0), ymOffset(-1)];
-  const regions = d1Query("SELECT lawd_cd, sigungu FROM regions ORDER BY lawd_cd");
+  let regions = d1Query("SELECT lawd_cd, sigungu FROM regions ORDER BY lawd_cd");
   if (regions.length === 0) {
     console.error("[ingest] regions 가 비어 있습니다. 웹앱 저장소의 seed.sql 을 먼저 적용하세요.");
     process.exit(1);
+  }
+  if (onlyCodes) {
+    regions = regions.filter((r) => onlyCodes.has(r.lawd_cd));
+    if (regions.length === 0) {
+      console.error(`[ingest] --only 로 지정한 지역이 regions 에 없습니다: ${onlyArg}`);
+      process.exit(1);
+    }
   }
 
   console.log(
