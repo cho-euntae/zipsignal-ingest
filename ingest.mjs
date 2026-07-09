@@ -51,6 +51,8 @@ const onlyCodes = onlyArg ? new Set(onlyArg.split(",").map((s) => s.trim())) : n
 // --source=apt-sale,offi-sale : 특정 수집 소스만. 생략 시 전체 6종.
 const sourceArg = args.find((a) => a.startsWith("--source="))?.split("=")[1];
 const sourceIds = sourceArg ? new Set(sourceArg.split(",").map((s) => s.trim())) : null;
+// --backfill : API 호출 없이 complexes 비정규화 캐시(거래수 등)만 지역별로 재계산.
+const backfillOnly = args.includes("--backfill");
 
 const API_KEY = process.env.DATA_GO_KR_API_KEY;
 if (!API_KEY) {
@@ -259,10 +261,13 @@ function rowsToSql(rows, lawdCd, ym, source) {
       `INSERT OR IGNORE INTO complexes (lawd_cd, umd_nm, name, jibun, build_year, property_type, slug) ` +
         `VALUES (${sqlStr(r.lawdCd)}, ${sqlStr(r.umd)}, ${sqlStr(r.name)}, ${sqlStr(r.jibun)}, ${sqlNum(r.buildYear)}, ${sqlStr(r.propertyType)}, ${sqlStr(r.slug)});`,
     );
+    // dedup_key 는 해제여부를 제외하므로, 이미 있는 거래가 나중에 해제되면
+    // ON CONFLICT 로 is_canceled/canceled_date 만 갱신 (해제 표시 정확성 = 차별화 요소).
     lines.push(
-      `INSERT OR IGNORE INTO trades (complex_id, trade_type, deal_date, price, monthly_rent, area, floor, is_canceled, canceled_date, dedup_key) ` +
+      `INSERT INTO trades (complex_id, trade_type, deal_date, price, monthly_rent, area, floor, is_canceled, canceled_date, dedup_key) ` +
         `SELECT id, ${sqlStr(r.tradeType)}, ${sqlStr(r.dealDate)}, ${sqlNum(r.price)}, ${sqlNum(r.monthlyRent)}, ${sqlNum(r.area)}, ${sqlNum(r.floor)}, ${r.canceled ? 1 : 0}, ${r.canceledDate ? sqlStr(r.canceledDate) : "NULL"}, ${sqlStr(r.dedupKey)} ` +
-        `FROM complexes WHERE lawd_cd = ${sqlStr(r.lawdCd)} AND umd_nm = ${sqlStr(r.umd)} AND name = ${sqlStr(r.name)} AND jibun = ${sqlStr(r.jibun)} AND property_type = ${sqlStr(r.propertyType)};`,
+        `FROM complexes WHERE lawd_cd = ${sqlStr(r.lawdCd)} AND umd_nm = ${sqlStr(r.umd)} AND name = ${sqlStr(r.name)} AND jibun = ${sqlStr(r.jibun)} AND property_type = ${sqlStr(r.propertyType)} ` +
+        `ON CONFLICT(dedup_key) DO UPDATE SET is_canceled = excluded.is_canceled, canceled_date = excluded.canceled_date;`,
     );
   }
   // ingest_log: trade_type 은 소스 단위 마커(SALE / RENT)로 기록해 커버리지 추적.
@@ -272,6 +277,18 @@ function rowsToSql(rows, lawdCd, ym, source) {
       `VALUES (${sqlStr(lawdCd)}, ${sqlStr(source.propertyType)}, ${sqlStr(logTradeType)}, ${sqlStr(ym)}, ${sqlNum(rows.length)});`,
   );
   return lines.join("\n");
+}
+
+// 지역 단위 비정규화 캐시 갱신 (complexes.trade_count/last_deal_date/last_sale_price).
+// 지역 목록 쿼리가 JOIN/집계 없이 인덱스 조회하도록. 지역별로 쪼개 CPU 한도 회피.
+function denormSql(lawdCd) {
+  return (
+    `UPDATE complexes SET ` +
+    `trade_count = (SELECT COUNT(*) FROM trades WHERE complex_id = complexes.id AND is_canceled = 0), ` +
+    `last_deal_date = (SELECT MAX(deal_date) FROM trades WHERE complex_id = complexes.id AND is_canceled = 0), ` +
+    `last_sale_price = (SELECT price FROM trades WHERE complex_id = complexes.id AND is_canceled = 0 AND trade_type = 'SALE' ORDER BY deal_date DESC, id DESC LIMIT 1) ` +
+    `WHERE lawd_cd = ${sqlStr(lawdCd)};`
+  );
 }
 
 // ---------- 메인 ----------
@@ -288,6 +305,21 @@ async function main() {
       console.error(`[ingest] --only 로 지정한 지역이 regions 에 없습니다: ${onlyArg}`);
       process.exit(1);
     }
+  }
+
+  // --backfill: API 없이 지역별 비정규화 캐시만 재계산 (일회성 마이그레이션)
+  if (backfillOnly) {
+    console.log(`[backfill] ${dbFlag} · 지역 ${regions.length}곳 비정규화 캐시 갱신`);
+    for (const region of regions) {
+      try {
+        d1File(denormSql(region.lawd_cd));
+        console.log(`  ✓ ${region.sigungu}`);
+      } catch (err) {
+        console.error(`  ✗ ${region.sigungu}: ${redact(err.message)}`);
+      }
+    }
+    console.log("[backfill] 완료");
+    return;
   }
 
   console.log(
@@ -317,9 +349,16 @@ async function main() {
     }
 
     if (regionSql.trim()) {
-      d1File(regionSql);
-      grandTotal += regionCount;
-      console.log(`  ✓ ${region.sigungu}: ${regionCount}건`);
+      // 적재 후 이 지역 비정규화 캐시 갱신 (같은 배치에 포함)
+      regionSql += denormSql(lawdCd) + "\n";
+      // 한 지역 적재 실패(D1 CPU 한도 등)가 이후 지역을 막지 않도록 격리
+      try {
+        d1File(regionSql);
+        grandTotal += regionCount;
+        console.log(`  ✓ ${region.sigungu}: ${regionCount}건`);
+      } catch (err) {
+        console.error(`  ✗ ${region.sigungu} 적재 실패: ${redact(err.message)}`);
+      }
     }
   }
 
