@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zipsignal-ingest",
+  // 이 저장소는 Worker 를 배포하지 않는다. wrangler d1 execute 로
+  // 웹앱과 공유하는 원격 D1(zipsignal-db)에 적재만 한다.
+  // database_id 는 자격증명이 아니며(접근엔 CLOUDFLARE_API_TOKEN 필요) 공개돼도 무방.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "zipsignal-db",
+      "database_id": "e73543ce-1417-4513-a603-e906a3e14a04"
+    }
+  ]
+}

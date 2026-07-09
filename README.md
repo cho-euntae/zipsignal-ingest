@@ -1,0 +1,58 @@
+# zipsignal-ingest
+
+[집시그널(ZipSignal)](https://zipsignal.darksyains.workers.dev) 의 **실거래 수집 배치**.
+국토교통부 아파트 매매 실거래가 공개 API(data.go.kr)를 긁어 Cloudflare D1(`zipsignal-db`)에 적재합니다.
+
+> 웹앱(UI·SEO) 저장소와 **분리**되어 있습니다. 이 저장소는 공개 API를 D1에 넣는 배치만 담당하며,
+> 웹앱은 별도 Private 저장소에서 같은 D1을 **읽기 전용**으로 사용합니다.
+
+```
+[이 저장소 · GitHub Actions cron, 매일]
+  → 국토부 API (지역 × 년월) → XML 파싱 → dedup_key 생성
+  → INSERT OR IGNORE 로 complexes/trades 적재 (ingest_log 기록)
+                      │
+                      ▼
+              Cloudflare D1 (zipsignal-db)
+                      ▲
+                      │  읽기 (SSR)
+        [웹앱 저장소 · Next.js on Workers]
+```
+
+## 동작 방식
+
+- D1의 `regions` 테이블에서 수집 대상 시군구를 읽어, 지역 × 년월로 API를 호출합니다.
+- 응답 XML을 파싱해 `complexes`(단지) / `trades`(거래) 로 upsert 하고, `dedup_key`(SHA-256)로 중복 적재를 막습니다.
+- `regions` 시드는 **웹앱 저장소의 `seed.sql`** 로 먼저 넣어야 합니다(이 저장소는 지역 시드를 하지 않음).
+
+## GitHub Actions Secrets
+
+저장소 Settings → Secrets and variables → Actions:
+
+| Secret | 값 |
+|---|---|
+| `DATA_GO_KR_API_KEY` | 공공데이터포털 **디코딩(Decoding)** 서비스 키 |
+| `CLOUDFLARE_API_TOKEN` | D1 쓰기 권한 토큰 |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 계정 ID |
+
+등록 후 **Actions → "실거래 수집 배치" → Run workflow** 로 수동 실행(`ym=202606` 등)해 검증. 이후 매일 04:00 KST cron 자동 실행됩니다.
+
+## 로컬 실행
+
+```bash
+npm install
+
+# 로컬 D1 (웹앱 저장소에서 스키마/시드 적용 후)
+DATA_GO_KR_API_KEY=<디코딩키> node ingest.mjs --local --ym=202606
+
+# 원격 D1 (wrangler login 세션 또는 CF 토큰 필요)
+DATA_GO_KR_API_KEY=<디코딩키> node ingest.mjs --remote --ym=202606
+```
+
+- `--ym` 생략 시 **당월 + 전월** 을 함께 수집(신고기한 30일 → 지연분 보정).
+- API 키는 **디코딩 키** 사용(인코딩 키는 이중 인코딩됨). 순수 16진수 키는 인코딩/디코딩 동일.
+
+## 운영 메모
+
+- 국토부 API 성공코드는 `resultCode: 0`(+`OK`). `resultCode` 가 빈 값이면 장애로 간주해 실패 처리.
+- 사용자 요청 경로에서는 국토부 API를 호출하지 않음 — 수집은 이 배치로만.
+- 저장소 Public: **코드는 공개, 시크릿은 GitHub Secrets/`.env`(gitignore)에만** 존재.

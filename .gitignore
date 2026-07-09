@@ -1,0 +1,9 @@
+/node_modules
+.DS_Store
+
+# secrets — 절대 커밋 금지
+.env*
+.dev.vars
+
+# wrangler
+.wrangler/
