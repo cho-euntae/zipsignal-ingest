@@ -61,6 +61,15 @@ if (ymArg !== undefined && !/^\d{6}$/.test(ymArg)) {
   console.error(`[ingest] --ym 형식 오류: '${ymArg}' (YYYYMM 6자리 숫자여야 함)`);
   process.exit(1);
 }
+// 값이 빈 필터(--source= / --only=)는 "전체 실행"으로 조용히 폴백되면 위험 → 오류 처리
+if (sourceArg === "") {
+  console.error("[ingest] --source= 값이 비어 있습니다. 소스 id 를 지정하세요.");
+  process.exit(1);
+}
+if (onlyArg === "") {
+  console.error("[ingest] --only= 값이 비어 있습니다. lawd_cd 를 지정하세요.");
+  process.exit(1);
+}
 if (sourceIds) {
   const valid = new Set(SOURCES.map((s) => s.id));
   const bad = [...sourceIds].filter((id) => !valid.has(id));
@@ -187,19 +196,23 @@ function mapItem(item, lawdCd, source) {
   const month = toInt(item.dealMonth);
   const day = toInt(item.dealDay);
   const area = toFloat(item.excluUseAr);
-  if (year === null || month === null || day === null || area === null) return null;
+  // 면적은 양수만 유효 (0/음수/누락은 통계 왜곡 → 버림)
+  if (year === null || month === null || day === null || area === null || area <= 0)
+    return null;
+  // 월/일 범위 방어 (toInt 는 "13"·"40" 도 통과시키므로 명시 검증)
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
 
   // 가격·거래구분: 매매는 dealAmount→price(SALE); 전월세는 deposit→price + monthlyRent
   let price, monthlyRent, tradeType;
   if (source.kind === "rent") {
     price = toInt(item.deposit); // 보증금(만원)
-    monthlyRent = toInt(item.monthlyRent) ?? 0; // 월세(만원)
-    if (price === null) return null;
+    monthlyRent = toInt(item.monthlyRent) ?? 0; // 월세(만원, 0이면 전세)
+    if (price === null || price < 0 || monthlyRent < 0) return null;
     tradeType = monthlyRent > 0 ? "MONTHLY" : "JEONSE";
   } else {
     price = toInt(item.dealAmount); // 거래금액(만원)
     monthlyRent = 0;
-    if (price === null) return null;
+    if (price === null || price <= 0) return null; // 매매가는 양수만
     tradeType = "SALE";
   }
 
@@ -256,7 +269,7 @@ function rowsToSql(rows, lawdCd, ym, source) {
   const logTradeType = source.kind === "rent" ? "RENT" : "SALE";
   lines.push(
     `INSERT INTO ingest_log (lawd_cd, property_type, trade_type, deal_ymd, row_count) ` +
-      `VALUES (${sqlStr(lawdCd)}, ${sqlStr(source.propertyType)}, ${sqlStr(logTradeType)}, ${sqlStr(ym)}, ${rows.length});`,
+      `VALUES (${sqlStr(lawdCd)}, ${sqlStr(source.propertyType)}, ${sqlStr(logTradeType)}, ${sqlStr(ym)}, ${sqlNum(rows.length)});`,
   );
   return lines.join("\n");
 }
