@@ -24,6 +24,7 @@ const DB_NAME = "zipsignal-db";
 const API_BASE = "https://apis.data.go.kr/1613000";
 const NUM_OF_ROWS = 1000;
 const FETCH_TIMEOUT_MS = 30_000;
+const STMT_CHUNK = 500; // d1File 트랜잭션당 최대 SQL 문 수 (D1 CPU 한도 회피)
 
 // ---------- 수집 소스 정의 (유형 × 거래구분) ----------
 // kind: "trade"(매매, dealAmount→price) | "rent"(전월세, deposit→price, monthlyRent 있으면 월세)
@@ -261,14 +262,18 @@ function rowsToSql(rows, lawdCd, ym, source) {
       `INSERT OR IGNORE INTO complexes (lawd_cd, umd_nm, name, jibun, build_year, property_type, slug) ` +
         `VALUES (${sqlStr(r.lawdCd)}, ${sqlStr(r.umd)}, ${sqlStr(r.name)}, ${sqlStr(r.jibun)}, ${sqlNum(r.buildYear)}, ${sqlStr(r.propertyType)}, ${sqlStr(r.slug)});`,
     );
-    // dedup_key 는 해제여부를 제외하므로, 이미 있는 거래가 나중에 해제되면
-    // ON CONFLICT 로 is_canceled/canceled_date 만 갱신 (해제 표시 정확성 = 차별화 요소).
     lines.push(
-      `INSERT INTO trades (complex_id, trade_type, deal_date, price, monthly_rent, area, floor, is_canceled, canceled_date, dedup_key) ` +
+      `INSERT OR IGNORE INTO trades (complex_id, trade_type, deal_date, price, monthly_rent, area, floor, is_canceled, canceled_date, dedup_key) ` +
         `SELECT id, ${sqlStr(r.tradeType)}, ${sqlStr(r.dealDate)}, ${sqlNum(r.price)}, ${sqlNum(r.monthlyRent)}, ${sqlNum(r.area)}, ${sqlNum(r.floor)}, ${r.canceled ? 1 : 0}, ${r.canceledDate ? sqlStr(r.canceledDate) : "NULL"}, ${sqlStr(r.dedupKey)} ` +
-        `FROM complexes WHERE lawd_cd = ${sqlStr(r.lawdCd)} AND umd_nm = ${sqlStr(r.umd)} AND name = ${sqlStr(r.name)} AND jibun = ${sqlStr(r.jibun)} AND property_type = ${sqlStr(r.propertyType)} ` +
-        `ON CONFLICT(dedup_key) DO UPDATE SET is_canceled = excluded.is_canceled, canceled_date = excluded.canceled_date;`,
+        `FROM complexes WHERE lawd_cd = ${sqlStr(r.lawdCd)} AND umd_nm = ${sqlStr(r.umd)} AND name = ${sqlStr(r.name)} AND jibun = ${sqlStr(r.jibun)} AND property_type = ${sqlStr(r.propertyType)};`,
     );
+    // dedup_key 는 해제여부를 제외 → 나중에 해제된 거래는 INSERT OR IGNORE 로 갱신 안 됨.
+    // 해제건(소수)만 별도 UPDATE 로 반영. (전 행 upsert 는 큰 구에서 D1 CPU 초과라 지양)
+    if (r.canceled) {
+      lines.push(
+        `UPDATE trades SET is_canceled = 1, canceled_date = ${r.canceledDate ? sqlStr(r.canceledDate) : "NULL"} WHERE dedup_key = ${sqlStr(r.dedupKey)};`,
+      );
+    }
   }
   // ingest_log: trade_type 은 소스 단위 마커(SALE / RENT)로 기록해 커버리지 추적.
   const logTradeType = source.kind === "rent" ? "RENT" : "SALE";
@@ -349,11 +354,15 @@ async function main() {
     }
 
     if (regionSql.trim()) {
-      // 적재 후 이 지역 비정규화 캐시 갱신 (같은 배치에 포함)
-      regionSql += denormSql(lawdCd) + "\n";
       // 한 지역 적재 실패(D1 CPU 한도 등)가 이후 지역을 막지 않도록 격리
       try {
-        d1File(regionSql);
+        // 대량 INSERT + denormSql 을 한 트랜잭션에 몰면 큰 구에서 D1 CPU 한도 초과.
+        // → INSERT 를 청크로 쪼개 각각 별도 트랜잭션으로, denormSql 도 분리.
+        const stmts = regionSql.split("\n").filter((s) => s.trim());
+        for (let i = 0; i < stmts.length; i += STMT_CHUNK) {
+          d1File(stmts.slice(i, i + STMT_CHUNK).join("\n"));
+        }
+        d1File(denormSql(lawdCd)); // 비정규화 캐시 갱신 (별도 트랜잭션)
         grandTotal += regionCount;
         console.log(`  ✓ ${region.sigungu}: ${regionCount}건`);
       } catch (err) {
