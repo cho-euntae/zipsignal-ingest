@@ -214,7 +214,12 @@ async function fetchPage(source, lawdCd, ym, pageNo) {
   const code =
     rawCode === undefined || rawCode === null ? undefined : String(rawCode).trim();
   if (code !== undefined && (code === "" || Number(code) !== 0)) {
-    throw new Error(`API ${rawCode}: ${parsed?.response?.header?.resultMsg ?? "unknown"}`);
+    const msg = parsed?.response?.header?.resultMsg ?? "unknown";
+    const err = new Error(`API ${rawCode}: ${msg}`);
+    // data.go.kr 은 트래픽 초과를 HTTP 200 + resultCode 로 준다 (하루 1만 호출 한도).
+    // 이건 잠깐 쉬면 풀리는 일시 오류라 재시도 대상으로 표시한다.
+    err.rateLimited = /LIMITED_NUMBER_OF_SERVICE_REQUESTS|EXCEEDS/i.test(String(msg));
+    throw err;
   }
   const body = parsed?.response?.body;
   const total = toInt(body?.totalCount) ?? 0;
@@ -223,12 +228,53 @@ async function fetchPage(source, lawdCd, ym, pageNo) {
   return { items, total };
 }
 
+const FETCH_RETRIES = 3;
+const FETCH_RETRY_BASE_MS = 2000;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 국토부 API 는 간헐적으로 끊긴다(fetch failed / 게이트웨이 5xx).
+ * 무인 배치라 한 번 끊기면 그 지역·유형·달이 통째로 빈다 → 재시도.
+ * (API 오류 응답(resultCode≠0)은 재시도해도 같으니 그대로 던진다)
+ */
+/**
+ * 재시도할 오류인가.
+ * - 네트워크 끊김·타임아웃·5xx: 다시 하면 될 수 있다
+ * - 429 / 트래픽 초과(resultCode 22): 레이트리밋 → 잠깐 쉬면 풀린다
+ *   (data.go.kr 은 트래픽 초과를 HTTP 200 + resultCode 로 주기도 한다)
+ * - 401·키 오류·잘못된 파라미터: 다시 해도 같다 → 즉시 실패
+ */
+function isTransientApiError(err) {
+  if (err.name === "TimeoutError") return true;
+  if (err.rateLimited) return true;
+  return /fetch failed|network|ECONN|socket|HTTP 429|HTTP 5\d\d/i.test(
+    String(err.message),
+  );
+}
+
+async function fetchPageWithRetry(source, lawdCd, ym, pageNo) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await fetchPage(source, lawdCd, ym, pageNo);
+    } catch (err) {
+      if (!isTransientApiError(err) || attempt >= FETCH_RETRIES) throw err;
+      const waitMs = FETCH_RETRY_BASE_MS * 2 ** (attempt - 1);
+      console.error(
+        `    ↻ API 실패 (${attempt}/${FETCH_RETRIES}) ${source.id} lawd=${lawdCd} ym=${ym} — ` +
+          `${waitMs / 1000}초 후 재시도: ${redact(err.message)}`,
+      );
+      await sleep(waitMs);
+    }
+  }
+}
+
 async function fetchAll(source, lawdCd, ym) {
-  const { items, total } = await fetchPage(source, lawdCd, ym, 1);
+  const { items, total } = await fetchPageWithRetry(source, lawdCd, ym, 1);
   const all = [...items];
   const pages = Math.ceil(total / NUM_OF_ROWS);
   for (let p = 2; p <= pages; p++) {
-    const next = await fetchPage(source, lawdCd, ym, p);
+    const next = await fetchPageWithRetry(source, lawdCd, ym, p);
     all.push(...next.items);
   }
   return all;
