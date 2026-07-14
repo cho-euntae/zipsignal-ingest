@@ -161,12 +161,33 @@ function d1Query(sql) {
   const first = Array.isArray(parsed) ? parsed[0] : parsed;
   return first?.results ?? [];
 }
+/** 일시 오류(동시 요청·레이트리밋·네트워크)로 하루치 데이터가 비지 않도록 재시도 */
+const D1_RETRIES = 3;
+const D1_RETRY_BASE_MS = 2000;
+
+function sleepSync(ms) {
+  // 배치 스크립트라 동기 대기로 충분 (Atomics.wait 은 타이머 없이 정확히 멈춘다)
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function d1File(sql) {
   const dir = mkdtempSync(join(tmpdir(), "zipsignal-"));
   const file = join(dir, "batch.sql");
   try {
     writeFileSync(file, sql, "utf8");
-    wrangler(["d1", "execute", DB_NAME, dbFlag, "--file", file]);
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        wrangler(["d1", "execute", DB_NAME, dbFlag, "--file", file]);
+        return;
+      } catch (err) {
+        if (attempt >= D1_RETRIES) throw err;
+        const waitMs = D1_RETRY_BASE_MS * 2 ** (attempt - 1);
+        console.error(
+          `    ↻ D1 적재 실패 (${attempt}/${D1_RETRIES}) — ${waitMs / 1000}초 후 재시도: ${redact(err.message).split("\n")[0]}`,
+        );
+        sleepSync(waitMs);
+      }
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
