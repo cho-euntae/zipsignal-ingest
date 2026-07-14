@@ -95,6 +95,16 @@ function sqlStr(v) {
   if (v === null || v === undefined || v === "") return "''";
   return `'${String(v).replace(/'/g, "''")}'`;
 }
+/**
+ * 외부(국토부) 텍스트에서 제어문자를 걷어낸다.
+ * - 개행이 섞이면 "한 줄 = 한 문장" 전제가 깨져 SQL 문장 경계가 어긋난다.
+ * - 0x1F 는 비정규화 갱신 키의 구분자라 데이터에 있으면 키가 충돌한다.
+ */
+function cleanText(v) {
+  return String(v ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim();
+}
 function sqlNum(v) {
   return v === null || v === undefined || Number.isNaN(v) ? "NULL" : String(v);
 }
@@ -220,9 +230,9 @@ function mapItem(item, lawdCd, source) {
   }
 
   const dealDate = `${year}-${pad2(month)}-${pad2(day)}`;
-  const umd = String(item.umdNm ?? "").trim();
-  const name = String(item[source.nameField] ?? "").trim();
-  const jibun = String(item.jibun ?? "").trim();
+  const umd = cleanText(item.umdNm);
+  const name = cleanText(item[source.nameField]);
+  const jibun = cleanText(item.jibun);
   const floor = toInt(item.floor);
   // 해제(취소)는 매매에만 존재. 전월세 응답엔 cdealType 이 없어 자연히 false.
   const canceled = String(item.cdealType ?? "").trim().toUpperCase() === "O";
@@ -255,6 +265,11 @@ function mapItem(item, lawdCd, source) {
 }
 
 // ---------- SQL 생성 ----------
+/**
+ * 문장 "배열"을 반환한다 (문자열로 합쳤다가 개행으로 다시 쪼개지 않는다).
+ * 값에 개행이 섞이면 "한 줄 = 한 문장" 전제가 깨져 청크 경계에서 문자열 리터럴이
+ * 잘린다 — cleanText 로도 막지만, 애초에 경계를 데이터에 의존하지 않게 한다.
+ */
 function rowsToSql(rows, lawdCd, ym, source) {
   const lines = [];
   for (const r of rows) {
@@ -281,19 +296,51 @@ function rowsToSql(rows, lawdCd, ym, source) {
     `INSERT INTO ingest_log (lawd_cd, property_type, trade_type, deal_ymd, row_count) ` +
       `VALUES (${sqlStr(lawdCd)}, ${sqlStr(source.propertyType)}, ${sqlStr(logTradeType)}, ${sqlStr(ym)}, ${sqlNum(rows.length)});`,
   );
-  return lines.join("\n");
+  return lines;
 }
 
-// 지역 단위 비정규화 캐시 갱신 (complexes.trade_count/last_deal_date/last_sale_price).
-// 지역 목록 쿼리가 JOIN/집계 없이 인덱스 조회하도록. 지역별로 쪼개 CPU 한도 회피.
+// 비정규화 캐시 갱신 (complexes.trade_count/last_deal_date/last_sale_price).
+// 지역 목록 쿼리가 JOIN/집계 없이 인덱스 조회하도록.
+
+const DENORM_SET =
+  `trade_count = (SELECT COUNT(*) FROM trades WHERE complex_id = complexes.id AND is_canceled = 0), ` +
+  `last_deal_date = (SELECT MAX(deal_date) FROM trades WHERE complex_id = complexes.id AND is_canceled = 0), ` +
+  `last_sale_price = (SELECT price FROM trades WHERE complex_id = complexes.id AND is_canceled = 0 AND trade_type = 'SALE' ORDER BY deal_date DESC, id DESC LIMIT 1)`;
+
+/** 지역 전체 재계산 (--backfill: 수동 D1 조작 후 캐시 복구용) */
 function denormSql(lawdCd) {
-  return (
-    `UPDATE complexes SET ` +
-    `trade_count = (SELECT COUNT(*) FROM trades WHERE complex_id = complexes.id AND is_canceled = 0), ` +
-    `last_deal_date = (SELECT MAX(deal_date) FROM trades WHERE complex_id = complexes.id AND is_canceled = 0), ` +
-    `last_sale_price = (SELECT price FROM trades WHERE complex_id = complexes.id AND is_canceled = 0 AND trade_type = 'SALE' ORDER BY deal_date DESC, id DESC LIMIT 1) ` +
-    `WHERE lawd_cd = ${sqlStr(lawdCd)};`
-  );
+  return `UPDATE complexes SET ${DENORM_SET} WHERE lawd_cd = ${sqlStr(lawdCd)};`;
+}
+
+// complexes 의 자연키(UNIQUE lawd_cd,umd_nm,name,jibun,property_type)를 한 문자열로.
+// 구분자는 데이터에 나올 수 없는 US(0x1F).
+const KEY_SEP = "\u001f";
+const complexKey = (r) =>
+  [r.umd, r.name, r.jibun, r.propertyType].join(KEY_SEP);
+
+const DENORM_KEY_CHUNK = 200; // UPDATE 한 문장이 건드리는 단지 수 (D1 CPU 한도 여유)
+
+/**
+ * 이번 배치가 실제로 건드린 단지만 갱신한다.
+ *
+ * 지역 전체를 갱신하면 새 거래가 한 건도 없어도 그 지역 단지 전부를 다시 쓴다
+ * (전국 4만 행). D1 무료 쓰기 한도가 10만 행/일이라, 매일 수집만 돌려도 한도의
+ * 40%가 캐시 갱신으로 날아가고 과거 백필을 같은 날 돌릴 여유가 없어진다.
+ */
+function denormSqlForKeys(lawdCd, keys) {
+  const stmts = [];
+  for (let i = 0; i < keys.length; i += DENORM_KEY_CHUNK) {
+    const inList = keys
+      .slice(i, i + DENORM_KEY_CHUNK)
+      .map((k) => sqlStr(k))
+      .join(", ");
+    stmts.push(
+      `UPDATE complexes SET ${DENORM_SET} ` +
+        `WHERE lawd_cd = ${sqlStr(lawdCd)} ` +
+        `AND (umd_nm || char(31) || name || char(31) || COALESCE(jibun, '') || char(31) || property_type) IN (${inList});`,
+    );
+  }
+  return stmts;
 }
 
 // ---------- 메인 ----------
@@ -333,10 +380,12 @@ async function main() {
   );
 
   let grandTotal = 0;
+  let failures = 0; // 실패가 하나라도 있으면 exit 1 → 스케줄러가 백필 큐를 넘기지 않는다
   for (const region of regions) {
     const lawdCd = region.lawd_cd;
-    let regionSql = "";
+    const stmts = [];
     let regionCount = 0;
+    const touchedKeys = new Set(); // 이번 배치에 거래가 있던 단지 (비정규화 갱신 대상)
 
     for (const source of activeSources) {
       for (const ym of months) {
@@ -345,33 +394,47 @@ async function main() {
           const rows = items
             .map((it) => mapItem(it, lawdCd, source))
             .filter((r) => r !== null);
-          regionSql += rowsToSql(rows, lawdCd, ym, source) + "\n";
+          stmts.push(...rowsToSql(rows, lawdCd, ym, source));
           regionCount += rows.length;
+          for (const r of rows) touchedKeys.add(complexKey(r));
         } catch (err) {
+          failures += 1;
           console.error(`  ✗ ${region.sigungu} ${source.id} ${ym}: ${redact(err.message)}`);
         }
       }
     }
 
-    if (regionSql.trim()) {
+    if (stmts.length > 0) {
       // 한 지역 적재 실패(D1 CPU 한도 등)가 이후 지역을 막지 않도록 격리
       try {
-        // 대량 INSERT + denormSql 을 한 트랜잭션에 몰면 큰 구에서 D1 CPU 한도 초과.
-        // → INSERT 를 청크로 쪼개 각각 별도 트랜잭션으로, denormSql 도 분리.
-        const stmts = regionSql.split("\n").filter((s) => s.trim());
+        // 대량 INSERT + denorm 을 한 트랜잭션에 몰면 큰 구에서 D1 CPU 한도 초과.
+        // → INSERT 를 청크로 쪼개 각각 별도 트랜잭션으로, denorm 도 분리.
         for (let i = 0; i < stmts.length; i += STMT_CHUNK) {
           d1File(stmts.slice(i, i + STMT_CHUNK).join("\n"));
         }
-        d1File(denormSql(lawdCd)); // 비정규화 캐시 갱신 (별도 트랜잭션)
+        // 이번 배치가 건드린 단지만 갱신 (지역 전체 갱신은 D1 쓰기 한도를 태운다)
+        for (const stmt of denormSqlForKeys(lawdCd, [...touchedKeys])) {
+          d1File(stmt);
+        }
         grandTotal += regionCount;
-        console.log(`  ✓ ${region.sigungu}: ${regionCount}건`);
+        console.log(`  ✓ ${region.sigungu}: ${regionCount}건 (단지 ${touchedKeys.size}곳 갱신)`);
       } catch (err) {
+        failures += 1;
         console.error(`  ✗ ${region.sigungu} 적재 실패: ${redact(err.message)}`);
       }
     }
   }
 
-  console.log(`[ingest] 완료 · 총 ${grandTotal}건 처리`);
+  console.log(`[ingest] 완료 · 총 ${grandTotal}건 처리 · 실패 ${failures}건`);
+
+  // 실패를 삼키고 exit 0 을 내면, 스케줄러(daily.sh)가 "성공"으로 보고 백필 큐를
+  // 다음 달로 넘겨버린다 → 그 달은 영영 빈 채로 남는다. 실패는 그대로 알린다.
+  if (failures > 0) {
+    console.error(
+      `[ingest] ${failures}건 실패 — 종료코드 1 (같은 달을 다시 돌리면 됩니다. INSERT OR IGNORE 라 중복 적재 안 됨)`,
+    );
+    process.exitCode = 1;
+  }
 }
 
 main().catch((err) => {

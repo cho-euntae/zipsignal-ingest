@@ -24,6 +24,33 @@
 - 응답 XML을 파싱해 `complexes`(단지) / `trades`(거래) 로 upsert 하고, `dedup_key`(SHA-256)로 중복 적재를 막습니다.
 - `regions` 시드는 **웹앱 저장소의 `seed.sql`** 로 먼저 넣어야 합니다(이 저장소는 지역 시드를 하지 않음).
 
+## 맥에서 매일 자동 수집 (launchd) — 현재 운영 방식
+
+GitHub Actions 는 **계정 잠금(카드 인증 실패)** 으로 못 씁니다. 대신 맥의 launchd 로 매일 돌립니다.
+
+```bash
+npx wrangler login          # 한 번만 (원격 D1 인증)
+./scripts/setup-mac.sh      # API 키(키체인) + 백필 큐 + launchd 등록
+```
+
+매일 07:30 에 [scripts/daily.sh](scripts/daily.sh) 가 두 가지를 합니다.
+
+1. **최신 수집** — 당월 + 전월 (신고 지연 30일 반영)
+2. **과거 백필** — 큐에서 한 달 꺼내 수집하고 한 달 되감기 (202605 → 202604 → …)
+
+> **왜 하루 한 달씩인가**: D1 무료 플랜은 **쓰기 10만 행/일**. 한 달치가 거래 ~6.5만 행이라
+> 하루에 두 달을 넣으면 한도를 넘깁니다. 열흘쯤 돌리면 1년치가 채워집니다.
+> (data.go.kr 호출은 한 달 = 122지역 × 6유형 = 732회라 1만/일 한도에 여유가 많습니다.)
+
+```bash
+tail -f ~/Library/Logs/zipsignal-ingest.log     # 로그
+launchctl kickstart -k gui/$UID/dev.zipsignal.ingest   # 즉시 실행
+./scripts/setup-mac.sh uninstall                # 해제
+```
+
+- API 키는 **저장소가 아니라 macOS 키체인**에 둡니다 (이 저장소는 Public).
+- 맥이 꺼져 있던 날은 건너뛰고, 켜지면 다음 스케줄에 이어서 진행합니다(큐 방식이라 진도가 밀리지 않음).
+
 ## GitHub Actions Secrets
 
 저장소 Settings → Secrets and variables → Actions:
