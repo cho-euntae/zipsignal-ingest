@@ -421,6 +421,61 @@ function denormSqlForKeys(lawdCd, keys) {
   return stmts;
 }
 
+/**
+ * 홈 화면 롤업 갱신 (웹앱의 region_stats / site_stats).
+ *
+ * 홈이 실시간 집계였을 때 1뷰당 D1 68만 행을 읽었다 — 무료 한도 500만 행/일이라
+ * 홈 7뷰면 그날 D1 이 잠긴다. 배치가 하루 한 번 계산해 두고 웹앱은 123행만 읽는다.
+ *
+ * 90일 거래수는 여기서 정확히 센다(trades 스캔은 배치라 괜찮다).
+ * 전국을 한 문장으로 돌리면 지금(거래 18만)은 통과하지만, 백필로 1년치가 쌓이면
+ * 스캔이 몇 배가 돼 D1 CPU 한도에 걸린다(5206e26·9b6061a 와 같은 사고) → 지역을 쪼갠다.
+ */
+const ROLLUP_REGION_CHUNK = 10;
+
+function rollupStats(regions) {
+  const codes = regions.map((r) => r.lawd_cd);
+
+  for (let i = 0; i < codes.length; i += ROLLUP_REGION_CHUNK) {
+    const inList = codes
+      .slice(i, i + ROLLUP_REGION_CHUNK)
+      .map((c) => sqlStr(c))
+      .join(", ");
+    d1File(
+      `INSERT OR REPLACE INTO region_stats
+         (lawd_cd, complex_count, trade_count_90d, latest_deal_date, updated_at)
+       SELECT c.lawd_cd,
+              COUNT(DISTINCT c.id),
+              COUNT(CASE WHEN t.is_canceled = 0
+                          AND t.deal_date >= date('now','-90 day') THEN 1 END),
+              MAX(CASE WHEN t.is_canceled = 0 THEN t.deal_date END),
+              datetime('now')
+       FROM complexes c
+       LEFT JOIN trades t ON t.complex_id = c.id
+       WHERE c.lawd_cd IN (${inList})
+       GROUP BY c.lawd_cd;`,
+    );
+  }
+
+  // 단지가 사라진 지역이 옛 숫자로 남지 않도록 (지금은 삭제 경로가 없지만 방어)
+  d1File(
+    `DELETE FROM region_stats
+     WHERE lawd_cd NOT IN (SELECT DISTINCT lawd_cd FROM complexes);`,
+  );
+
+  // site_stats 는 region_stats 를 참조(region_count) → 반드시 뒤에
+  d1File(
+    `INSERT OR REPLACE INTO site_stats
+       (id, total_trades, total_complexes, region_count, latest_deal_date, updated_at)
+     SELECT 1,
+       (SELECT COUNT(*) FROM trades WHERE is_canceled = 0),
+       (SELECT COUNT(*) FROM complexes),
+       (SELECT COUNT(*) FROM region_stats WHERE complex_count > 0),
+       (SELECT MAX(deal_date) FROM trades WHERE is_canceled = 0),
+       datetime('now');`,
+  );
+}
+
 // ---------- 메인 ----------
 async function main() {
   const months = ymArg ? [ymArg] : [ymOffset(0), ymOffset(-1)];
@@ -437,7 +492,7 @@ async function main() {
     }
   }
 
-  // --backfill: API 없이 지역별 비정규화 캐시만 재계산 (일회성 마이그레이션)
+  // --backfill: API 없이 지역별 비정규화 캐시만 재계산 (수동 D1 조작 후 복구용)
   if (backfillOnly) {
     console.log(`[backfill] ${dbFlag} · 지역 ${regions.length}곳 비정규화 캐시 갱신`);
     for (const region of regions) {
@@ -448,7 +503,11 @@ async function main() {
         console.error(`  ✗ ${region.sigungu}: ${redact(err.message)}`);
       }
     }
-    console.log("[backfill] 완료");
+    // 캐시를 고쳐놓고 홈 롤업을 안 고치면, 복구 후에도 홈은 옛 숫자를 계속 보여준다
+    // (--only 로 일부만 돌렸어도 롤업은 전 지역 기준으로 다시 계산해야 정합이 맞는다)
+    const allRegions = d1Query("SELECT lawd_cd FROM regions ORDER BY lawd_cd");
+    rollupStats(allRegions);
+    console.log("[backfill] 완료 · 홈 롤업 갱신 완료");
     return;
   }
 
@@ -501,6 +560,19 @@ async function main() {
         console.error(`  ✗ ${region.sigungu} 적재 실패: ${redact(err.message)}`);
       }
     }
+  }
+
+  // 홈 롤업 갱신 (실시간 집계면 홈 1뷰에 D1 68만 행을 읽는다).
+  // --only 로 일부 지역만 돌렸어도 site_stats 는 전체 기준이라 전 지역으로 계산한다.
+  try {
+    const allRegions = onlyCodes
+      ? d1Query("SELECT lawd_cd FROM regions ORDER BY lawd_cd")
+      : regions;
+    rollupStats(allRegions);
+    console.log("[ingest] 홈 롤업(region_stats/site_stats) 갱신 완료");
+  } catch (err) {
+    failures += 1;
+    console.error(`[ingest] 홈 롤업 갱신 실패: ${redact(err.message)}`);
   }
 
   console.log(`[ingest] 완료 · 총 ${grandTotal}건 처리 · 실패 ${failures}건`);
