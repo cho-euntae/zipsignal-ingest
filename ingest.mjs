@@ -138,11 +138,22 @@ function ymOffset(offset) {
 
 // ---------- wrangler ----------
 function wrangler(execArgs) {
-  return execFileSync("npx", ["wrangler", ...execArgs], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  try {
+    return execFileSync("npx", ["wrangler", ...execArgs], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (err) {
+    // execFileSync 의 기본 메시지는 "Command failed: ..." 뿐이라 원인(D1 CPU 한도,
+    // 쿼터 초과, SQL 오류)이 통째로 사라진다 → wrangler 가 stderr 로 뱉은 본문을 붙인다.
+    const detail = [err.stderr, err.stdout]
+      .map((s) => (s ? String(s).trim() : ""))
+      .filter(Boolean)
+      .join(" | ")
+      .slice(0, 800);
+    throw new Error(detail ? `${err.message}\n    ↳ ${detail}` : err.message);
+  }
 }
 function d1Query(sql) {
   const out = wrangler(["d1", "execute", DB_NAME, dbFlag, "--json", "--command", sql]);
