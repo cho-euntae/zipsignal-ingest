@@ -62,6 +62,14 @@ launchctl kickstart -k gui/$UID/dev.zipsignal.ingest   # 즉시 실행
 - API 키는 **저장소가 아니라 macOS 키체인**에 둡니다 (이 저장소는 Public).
 - 맥이 꺼져 있던 날은 건너뛰고, 켜지면 다음 스케줄에 이어서 진행합니다(큐 방식이라 진도가 밀리지 않음).
 
+**실패 알림**: 수집·백필이 실패하면 알린다(로그만 보면 조용한 실패를 놓친다 — 실제로 2026-07-15 아침 7403 을 늦게 발견).
+- 기본: **맥 알림센터**(설정 0).
+- webhook(Slack 등)을 키체인 `zipsignal-notify-webhook` 에 넣으면 그리로도 보냄:
+  ```bash
+  security add-generic-password -s zipsignal-notify-webhook -a "$USER" -U -w   # 프롬프트에 URL 붙여넣기
+  ```
+  Slack Incoming Webhook URL 이면 `{"text":...}` 로 전송(Discord 호환).
+
 ## GitHub Actions Secrets
 
 저장소 Settings → Secrets and variables → Actions:

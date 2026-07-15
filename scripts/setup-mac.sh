@@ -16,6 +16,7 @@ STATE_DIR="$HOME/.local/state/zipsignal"
 LOG_FILE="$HOME/Library/Logs/zipsignal-ingest.log"
 KEYCHAIN_API="zipsignal-data-go-kr"
 KEYCHAIN_CF_TOKEN="zipsignal-cf-token"
+KEYCHAIN_WEBHOOK="zipsignal-notify-webhook"
 
 if [[ "${1:-}" == "uninstall" ]]; then
   launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
@@ -49,6 +50,23 @@ else
   [[ -n "$cftoken" ]] || { echo "❌ 토큰이 비어 있습니다"; exit 1; }
   security add-generic-password -s "$KEYCHAIN_CF_TOKEN" -a "$USER" -w "$cftoken" -U
   echo "✓ 저장했습니다"
+fi
+
+# ---------- 1c. 알림 webhook (선택 — 없으면 맥 알림센터로 폴백) ----------
+if security find-generic-password -s "$KEYCHAIN_WEBHOOK" -w >/dev/null 2>&1; then
+  echo "✓ 키체인에 알림 webhook 이 이미 있습니다"
+else
+  echo
+  echo "실패 알림 webhook URL (선택). 비우고 Enter 치면 맥 알림센터만 씁니다."
+  echo "  Slack: 워크스페이스 → Incoming Webhooks 앱 → Add → 채널 선택 → URL 복사"
+  read -rsp "NOTIFY_WEBHOOK_URL (선택): " hook
+  echo
+  if [[ -n "$hook" ]]; then
+    security add-generic-password -s "$KEYCHAIN_WEBHOOK" -a "$USER" -w "$hook" -U
+    echo "✓ 저장했습니다 (수집 실패 시 이리로 알림)"
+  else
+    echo "ℹ️ 건너뜀 — 실패 시 맥 알림센터로만 알립니다"
+  fi
 fi
 
 # ---------- 2. 백필 큐 ----------

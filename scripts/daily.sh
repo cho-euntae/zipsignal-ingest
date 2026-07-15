@@ -18,12 +18,13 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"  # 순수 문자열 (실패 불가)
 STATE_DIR="$HOME/.local/state/zipsignal"
 QUEUE_FILE="$STATE_DIR/backfill-next"   # 다음에 백필할 YYYYMM
 FLOOR_FILE="$STATE_DIR/backfill-floor"  # 여기까지만 백필 (그 이전은 멈춤)
 KEYCHAIN_API="zipsignal-data-go-kr"     # 국토부 API 키
 KEYCHAIN_CF_TOKEN="zipsignal-cf-token"  # Cloudflare API 토큰 (D1 Edit)
+KEYCHAIN_WEBHOOK="zipsignal-notify-webhook"  # (선택) Slack 등 알림 webhook URL
 CLOUDFLARE_ACCOUNT_ID="44db11dbbdd3cedbb78195406be3a6db"
 
 # launchd 는 PATH 가 빈약하다 → node/npx 경로 확보
@@ -31,9 +32,42 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# 배치 실패 알림. webhook 이 있으면 그리로(Slack 등), 없으면 맥 알림센터로 폴백.
+# 실패는 로그만 남기면 사람이 봐야만 안다 — 오늘 아침 7403 도 그래서 늦게 발견했다.
+#
+# 메시지 이스케이프는 수제로 하지 않는다(백슬래시·따옴표 조합에서 문자열 경계가 깨진다).
+# JSON 은 node(반드시 있음)로 인코딩, AppleScript 는 argv 로 넘겨 소스에 안 섞이게 한다.
+notify() {
+  local msg="$1"
+  log "🔔 알림: $msg"
+
+  local hook
+  if hook="$(security find-generic-password -s "$KEYCHAIN_WEBHOOK" -w 2>/dev/null)" && [[ -n "$hook" ]]; then
+    local payload
+    payload="$(MSG="$msg" node -e 'process.stdout.write(JSON.stringify({text:"[집시그널 수집] "+process.env.MSG}))')"
+    # 실패해도 배치를 막지 않는다. URL 이 새지 않도록 출력 전부 버린다.
+    curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+      --data "$payload" "$hook" >/dev/null 2>&1 || log "⚠️ webhook 전송 실패 (URL 확인 필요)"
+  fi
+
+  # 맥 알림센터. msg 를 AppleScript 소스에 보간하지 않고 argv(item 1)로 전달.
+  osascript - "$msg" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+  display notification (item 1 of argv) with title "집시그널 수집 실패"
+end run
+APPLESCRIPT
+}
+
+# 구체적 실패는 fail() 로 (명확한 메시지), 예기치 못한 죽음은 trap 이 백스톱.
+NOTIFIED=0
+fail() { notify "$1"; NOTIFIED=1; exit 1; }
+trap 'code=$?; [[ $code -ne 0 && $NOTIFIED -eq 0 ]] && notify "배치가 예기치 못하게 종료 (exit $code) — 로그 확인"' EXIT
+
+# 이 시점부터 실패는 trap 이 알림을 보낸다 (앞은 순수 문자열 할당뿐이라 사각지대 없음)
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 if ! DATA_GO_KR_API_KEY="$(security find-generic-password -s "$KEYCHAIN_API" -w 2>/dev/null)"; then
-  log "❌ 키체인에서 국토부 API 키를 못 찾음 (서비스명: $KEYCHAIN_API). scripts/setup-mac.sh 를 먼저 실행하세요."
-  exit 1
+  fail "국토부 API 키를 키체인에서 못 찾음 — setup-mac.sh 재실행 필요"
 fi
 export DATA_GO_KR_API_KEY
 
@@ -59,8 +93,7 @@ log "▶ 최신 수집 시작 (당월+전월)"
 if node ingest.mjs --remote; then
   log "✅ 최신 수집 완료"
 else
-  log "❌ 최신 수집 실패 — 백필은 건너뜀 (D1 쓰기 한도를 아껴둔다)"
-  exit 1
+  fail "최신 수집 실패 — 백필 건너뜀. ~/Library/Logs/zipsignal-ingest.log 확인"
 fi
 
 # ---------- 2. 과거 백필 (하루 한 달) ----------
@@ -73,8 +106,7 @@ YM="$(tr -d '[:space:]' < "$QUEUE_FILE")"
 FLOOR="$(tr -d '[:space:]' < "$FLOOR_FILE" 2>/dev/null || echo "")"
 
 if [[ ! "$YM" =~ ^[0-9]{6}$ ]]; then
-  log "❌ 백필 큐 값이 이상함: '$YM' (YYYYMM 이어야 함)"
-  exit 1
+  fail "백필 큐 값이 이상함: '$YM' (YYYYMM 이어야 함)"
 fi
 # 하한이 깨져 있으면(빈 값·오타) 비교가 항상 거짓이 돼 과거로 무한히 내려간다 → 기본값으로
 if [[ ! "$FLOOR" =~ ^[0-9]{6}$ ]]; then
@@ -100,6 +132,5 @@ if node ingest.mjs --remote --ym="$YM"; then
   echo "$PREV" > "$QUEUE_FILE"
   log "✅ 백필 완료 · $YM → 다음 차례 $PREV"
 else
-  log "❌ 백필 실패 · $YM (큐 그대로 두고 내일 재시도)"
-  exit 1
+  fail "백필 실패 · $YM (큐 유지, 내일 재시도)"
 fi
