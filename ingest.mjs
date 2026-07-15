@@ -54,9 +54,12 @@ const sourceArg = args.find((a) => a.startsWith("--source="))?.split("=")[1];
 const sourceIds = sourceArg ? new Set(sourceArg.split(",").map((s) => s.trim())) : null;
 // --backfill : API 호출 없이 complexes 비정규화 캐시(거래수 등)만 지역별로 재계산.
 const backfillOnly = args.includes("--backfill");
+// --audit : API·쓰기 없이 ingest_log 를 분석해 누락(수집 안 된 조합)을 리포트.
+const auditOnly = args.includes("--audit");
 
 const API_KEY = process.env.DATA_GO_KR_API_KEY;
-if (!API_KEY) {
+// --audit 는 ingest_log 만 읽으므로 API 키가 필요 없다.
+if (!API_KEY && !auditOnly) {
   console.error("[ingest] DATA_GO_KR_API_KEY 가 설정되지 않았습니다.");
   process.exit(1);
 }
@@ -373,10 +376,13 @@ function rowsToSql(rows, lawdCd, ym, source) {
     }
   }
   // ingest_log: trade_type 은 소스 단위 마커(SALE / RENT)로 기록해 커버리지 추적.
+  // UPSERT — 재수집 시 새 행을 쌓지 않고 조합당 1행 유지(최신 건수·시각). UNIQUE 제약 필요.
   const logTradeType = source.kind === "rent" ? "RENT" : "SALE";
   lines.push(
-    `INSERT INTO ingest_log (lawd_cd, property_type, trade_type, deal_ymd, row_count) ` +
-      `VALUES (${sqlStr(lawdCd)}, ${sqlStr(source.propertyType)}, ${sqlStr(logTradeType)}, ${sqlStr(ym)}, ${sqlNum(rows.length)});`,
+    `INSERT INTO ingest_log (lawd_cd, property_type, trade_type, deal_ymd, row_count, fetched_at) ` +
+      `VALUES (${sqlStr(lawdCd)}, ${sqlStr(source.propertyType)}, ${sqlStr(logTradeType)}, ${sqlStr(ym)}, ${sqlNum(rows.length)}, datetime('now')) ` +
+      `ON CONFLICT (lawd_cd, property_type, trade_type, deal_ymd) ` +
+      `DO UPDATE SET row_count = excluded.row_count, fetched_at = excluded.fetched_at;`,
   );
   return lines;
 }
@@ -480,8 +486,86 @@ function rollupStats(regions) {
   );
 }
 
+/**
+ * 누락 감지: ingest_log 를 분석해 수집된 각 달의 (지역 × 6소스) 조합 중
+ *   - MISSING: 로그 자체가 없음 = 수집 안 됨 (진짜 문제, 재수집 필요)
+ *   - EMPTY:   로그는 있고 row_count=0 = 데이터 공백 (광주 5구 등 정상일 수 있음)
+ * 을 구분해 리포트한다. API·D1 쓰기 없음. MISSING 이 있으면 exit 1.
+ */
+function audit() {
+  const regions = d1Query("SELECT lawd_cd, sigungu FROM regions ORDER BY lawd_cd");
+  const sigunguOf = new Map(regions.map((r) => [r.lawd_cd, r.sigungu]));
+  const logs = d1Query(
+    "SELECT lawd_cd, property_type, trade_type, deal_ymd, row_count FROM ingest_log",
+  );
+  if (logs.length === 0) {
+    console.log("[audit] ingest_log 가 비어 있음 — 수집 이력 없음");
+    return;
+  }
+
+  // 지역은 반드시 lawd_cd 로 식별한다. 시군구 이름은 중복이다(서울/부산/대구 중구 등).
+  const key = (lawd, pt, tt, ym) => `${lawd}|${pt}|${tt}|${ym}`;
+  const logged = new Map(logs.map((l) => [key(l.lawd_cd, l.property_type, l.trade_type, l.deal_ymd), l.row_count]));
+
+  // --ym 지정 시 그 달만 검사(자동화용, 누락 있으면 exit 1).
+  // 미지정 시 수집된 전체 달 리포트(개관용) — 최신 백필 달은 진행 중이라 부분적인 게 정상.
+  const months = ymArg ? [ymArg] : [...new Set(logs.map((l) => l.deal_ymd))].sort();
+
+  const missing = [];
+  const empty = [];
+  for (const ym of months) {
+    for (const r of regions) {
+      for (const s of SOURCES) {
+        const tt = s.kind === "rent" ? "RENT" : "SALE";
+        const k = key(r.lawd_cd, s.propertyType, tt, ym);
+        if (!logged.has(k)) missing.push({ ym, lawdCd: r.lawd_cd, source: s.id });
+        else if ((logged.get(k) ?? 0) === 0) empty.push({ ym, lawdCd: r.lawd_cd });
+      }
+    }
+  }
+
+  const expected = months.length * regions.length * SOURCES.length;
+  console.log(`[audit] 검사 월 [${months.join(", ")}] · 지역 ${regions.length} · 소스 ${SOURCES.length}`);
+  console.log(`[audit] 기대 조합 ${expected} · MISSING ${missing.length} · EMPTY ${empty.length}`);
+
+  // EMPTY: 한 지역이 모든 달·소스에서 0건이면 "데이터 공백 지역"(광산구 등, 정상)
+  const emptyByRegion = new Map();
+  for (const e of empty) emptyByRegion.set(e.lawdCd, (emptyByRegion.get(e.lawdCd) ?? 0) + 1);
+  const fullyEmpty = [...emptyByRegion.entries()]
+    .filter(([, n]) => n === months.length * SOURCES.length)
+    .map(([code]) => `${sigunguOf.get(code)}(${code})`);
+  if (fullyEmpty.length) {
+    console.log(`[audit] 전 기간·전 소스 0건(데이터 공백 지역): ${fullyEmpty.join(", ")}`);
+  }
+
+  if (missing.length) {
+    console.log("[audit] ⚠️ MISSING (수집 안 됨 — 재수집 필요):");
+    const byRegionYm = new Map(); // "ym lawdCd" → [source...]
+    for (const m of missing) {
+      const g = `${m.ym}|${m.lawdCd}`;
+      byRegionYm.set(g, (byRegionYm.get(g) ?? []).concat(m.source));
+    }
+    for (const [g, srcs] of byRegionYm) {
+      const [ym, code] = g.split("|");
+      console.log(`  ✗ ${ym} ${sigunguOf.get(code)}(${code}): ${srcs.join(", ")}`);
+    }
+    const codes = [...new Set(missing.map((m) => m.lawdCd))];
+    const ymFlag = ymArg ? ` --ym=${ymArg}` : "";
+    console.log(`  → 재수집: node ingest.mjs --remote --only=${codes.join(",")}${ymFlag}`);
+    // --ym 지정(특정 달 검사)일 때만 실패로 취급. 전체 개관은 정보 제공(exit 0).
+    if (ymArg) process.exitCode = 1;
+  } else {
+    console.log("[audit] ✅ 누락 없음");
+  }
+}
+
 // ---------- 메인 ----------
 async function main() {
+  if (auditOnly) {
+    audit();
+    return;
+  }
+
   const months = ymArg ? [ymArg] : [ymOffset(0), ymOffset(-1)];
   let regions = d1Query("SELECT lawd_cd, sigungu FROM regions ORDER BY lawd_cd");
   if (regions.length === 0) {
