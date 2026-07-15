@@ -9,9 +9,15 @@
 //   node ingest.mjs --remote --ym=202606             # 특정 년월만
 //   node ingest.mjs --remote --only=11680,41135      # 특정 시군구만
 //   node ingest.mjs --remote --source=apt-sale,offi-sale  # 특정 유형만
+//   node ingest.mjs --remote --audit                 # 누락 감지(개관, API 키 불필요)
+//   node ingest.mjs --remote --audit --ym=202606     # 특정 달 검사, 누락 있으면 exit 1
 //
-// 필수 환경변수: DATA_GO_KR_API_KEY (디코딩 키)
-// 원격(--remote) 추가: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID (Actions Secrets)
+// ⚠️ ingest_log UPSERT 는 UNIQUE 인덱스(idx_ingest_unique)에 의존한다. 웹앱 저장소의
+//    migrations/2026-07-15-ingest-log-dedup.sql 을 대상 D1 에 먼저 적용해야 한다
+//    (미적용 D1 에서 수집하면 ON CONFLICT 매칭 실패로 전 지역 적재 실패).
+//
+// 필수 환경변수: DATA_GO_KR_API_KEY (디코딩 키). --audit 는 불필요.
+// 원격(--remote) 추가: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
 
 import { XMLParser } from "fast-xml-parser";
 import { createHash } from "node:crypto";
@@ -381,6 +387,8 @@ function rowsToSql(rows, lawdCd, ym, source) {
   lines.push(
     `INSERT INTO ingest_log (lawd_cd, property_type, trade_type, deal_ymd, row_count, fetched_at) ` +
       `VALUES (${sqlStr(lawdCd)}, ${sqlStr(source.propertyType)}, ${sqlStr(logTradeType)}, ${sqlStr(ym)}, ${sqlNum(rows.length)}, datetime('now')) ` +
+      // 최신 수집값으로 덮는다(신고 누적으로 보통 늘지만, 정정·해제로 줄 수도 있으니
+      // MAX 가드는 두지 않는다 — 최신이 진실). audit 의 EMPTY 판정 기준이 된다.
       `ON CONFLICT (lawd_cd, property_type, trade_type, deal_ymd) ` +
       `DO UPDATE SET row_count = excluded.row_count, fetched_at = excluded.fetched_at;`,
   );
@@ -494,6 +502,12 @@ function rollupStats(regions) {
  */
 function audit() {
   const regions = d1Query("SELECT lawd_cd, sigungu FROM regions ORDER BY lawd_cd");
+  if (regions.length === 0) {
+    // 가드 없으면 기대조합=0 이라 "누락 없음" 오탐 (잘못된 DB 타겟·미시드 로컬)
+    console.error("[audit] regions 가 비어 있음 — DB 타겟/시드 확인 필요");
+    process.exitCode = 1;
+    return;
+  }
   const sigunguOf = new Map(regions.map((r) => [r.lawd_cd, r.sigungu]));
   const logs = d1Query(
     "SELECT lawd_cd, property_type, trade_type, deal_ymd, row_count FROM ingest_log",
