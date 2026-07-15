@@ -7,8 +7,12 @@
 # 왜 하루 한 달씩인가: D1 무료 플랜은 쓰기 10만 행/일. 한 달치가 거래 ~6.5만 행이라
 # 하루에 두 달을 넣으면 한도를 넘긴다. 열흘쯤 돌리면 1년치가 채워진다.
 #
-# API 키는 저장소가 아니라 macOS 키체인에 둔다 (이 저장소는 Public).
+# 비밀값은 저장소가 아니라 macOS 키체인에 둔다 (이 저장소는 Public).
 #   security add-generic-password -s zipsignal-data-go-kr -a "$USER" -w '<디코딩키>'
+#   security add-generic-password -s zipsignal-cf-token   -a "$USER" -w '<CF API 토큰>'
+#
+# ⚠️ wrangler OAuth(로그인 세션)는 무인 배치에 부적합하다 — 토큰이 만료되면 launchd
+#    실행이 code:7403 로 죽는다. 그래서 장수 API 토큰(CLOUDFLARE_API_TOKEN)을 쓴다.
 #
 # 설치: scripts/setup-mac.sh 참고
 
@@ -18,18 +22,34 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="$HOME/.local/state/zipsignal"
 QUEUE_FILE="$STATE_DIR/backfill-next"   # 다음에 백필할 YYYYMM
 FLOOR_FILE="$STATE_DIR/backfill-floor"  # 여기까지만 백필 (그 이전은 멈춤)
-KEYCHAIN_SERVICE="zipsignal-data-go-kr"
+KEYCHAIN_API="zipsignal-data-go-kr"     # 국토부 API 키
+KEYCHAIN_CF_TOKEN="zipsignal-cf-token"  # Cloudflare API 토큰 (D1 Edit)
+CLOUDFLARE_ACCOUNT_ID="44db11dbbdd3cedbb78195406be3a6db"
 
 # launchd 는 PATH 가 빈약하다 → node/npx 경로 확보
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
-if ! DATA_GO_KR_API_KEY="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)"; then
-  log "❌ 키체인에서 API 키를 못 찾음 (서비스명: $KEYCHAIN_SERVICE). scripts/setup-mac.sh 를 먼저 실행하세요."
+if ! DATA_GO_KR_API_KEY="$(security find-generic-password -s "$KEYCHAIN_API" -w 2>/dev/null)"; then
+  log "❌ 키체인에서 국토부 API 키를 못 찾음 (서비스명: $KEYCHAIN_API). scripts/setup-mac.sh 를 먼저 실행하세요."
   exit 1
 fi
 export DATA_GO_KR_API_KEY
+
+# Cloudflare 인증: API 토큰이 있으면 OAuth 대신 그걸 쓴다(wrangler 규약).
+# account_id 는 어느 경로든 필요하므로 무조건 export (OAuth 폴백도 비대화형이라 필요).
+export CLOUDFLARE_ACCOUNT_ID
+CF_TOKEN="$(security find-generic-password -s "$KEYCHAIN_CF_TOKEN" -w 2>&1)" && CF_TOKEN_OK=1 || CF_TOKEN_OK=0
+if [[ "$CF_TOKEN_OK" == "1" ]]; then
+  export CLOUDFLARE_API_TOKEN="$CF_TOKEN"
+  unset CF_TOKEN
+else
+  # 실패 원인(항목 없음 vs 키체인 잠금)을 남겨야 진단이 된다
+  log "⚠️ CF API 토큰($KEYCHAIN_CF_TOKEN) 못 읽음 → wrangler login 세션에 의존(만료 위험)."
+  log "   원인: ${CF_TOKEN:-알수없음}. setup-mac.sh 재실행 또는 키체인 잠금 해제 확인."
+  unset CF_TOKEN
+fi
 
 cd "$REPO_DIR"
 mkdir -p "$STATE_DIR"

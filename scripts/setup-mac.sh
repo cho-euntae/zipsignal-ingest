@@ -14,7 +14,8 @@ LABEL="dev.zipsignal.ingest"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 STATE_DIR="$HOME/.local/state/zipsignal"
 LOG_FILE="$HOME/Library/Logs/zipsignal-ingest.log"
-KEYCHAIN_SERVICE="zipsignal-data-go-kr"
+KEYCHAIN_API="zipsignal-data-go-kr"
+KEYCHAIN_CF_TOKEN="zipsignal-cf-token"
 
 if [[ "${1:-}" == "uninstall" ]]; then
   launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
@@ -23,16 +24,31 @@ if [[ "${1:-}" == "uninstall" ]]; then
   exit 0
 fi
 
-# ---------- 1. API 키 (키체인) ----------
-if security find-generic-password -s "$KEYCHAIN_SERVICE" -w >/dev/null 2>&1; then
-  echo "✓ 키체인에 API 키가 이미 있습니다"
+# ---------- 1a. 국토부 API 키 (키체인) ----------
+if security find-generic-password -s "$KEYCHAIN_API" -w >/dev/null 2>&1; then
+  echo "✓ 키체인에 국토부 API 키가 이미 있습니다"
 else
   echo "공공데이터포털 인증키(디코딩 키)를 입력하세요. 입력값은 화면에 안 보입니다."
   read -rsp "DATA_GO_KR_API_KEY: " key
   echo
   [[ -n "$key" ]] || { echo "❌ 키가 비어 있습니다"; exit 1; }
-  security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$USER" -w "$key" -U
-  echo "✓ 키체인에 저장했습니다 (저장소에는 남지 않습니다)"
+  security add-generic-password -s "$KEYCHAIN_API" -a "$USER" -w "$key" -U
+  echo "✓ 저장했습니다 (저장소에는 남지 않습니다)"
+fi
+
+# ---------- 1b. Cloudflare API 토큰 (무인 배치용 — OAuth 는 만료돼 못 씀) ----------
+if security find-generic-password -s "$KEYCHAIN_CF_TOKEN" -w >/dev/null 2>&1; then
+  echo "✓ 키체인에 Cloudflare API 토큰이 이미 있습니다"
+else
+  echo
+  echo "Cloudflare API 토큰(D1 Edit 권한)을 입력하세요. 입력값은 화면에 안 보입니다."
+  echo "  발급: https://dash.cloudflare.com/profile/api-tokens → Create Custom Token"
+  echo "        → Account · D1 · Edit 권한 추가"
+  read -rsp "CLOUDFLARE_API_TOKEN: " cftoken
+  echo
+  [[ -n "$cftoken" ]] || { echo "❌ 토큰이 비어 있습니다"; exit 1; }
+  security add-generic-password -s "$KEYCHAIN_CF_TOKEN" -a "$USER" -w "$cftoken" -U
+  echo "✓ 저장했습니다"
 fi
 
 # ---------- 2. 백필 큐 ----------
@@ -64,6 +80,8 @@ echo "✓ 백필: $(cat "$STATE_DIR/backfill-next") → $(cat "$STATE_DIR/backfi
 
 # ---------- 3. launchd ----------
 mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG_FILE")"
+# 로그에 wrangler stderr 가 섞일 수 있으니 소유자만 읽게 (기본 644 → 600)
+touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -102,4 +120,4 @@ echo "로그:      tail -f $LOG_FILE"
 echo "즉시 실행: launchctl kickstart -k gui/$UID/$LABEL"
 echo "해제:      ./scripts/setup-mac.sh uninstall"
 echo
-echo "⚠️ wrangler 로그인 세션이 필요합니다 (한 번만): npx wrangler login"
+echo "✓ Cloudflare 인증은 키체인의 API 토큰을 씁니다 (wrangler login 불필요 — OAuth 는 만료돼 무인 배치에 부적합)"

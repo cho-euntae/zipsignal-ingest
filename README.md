@@ -29,9 +29,20 @@
 GitHub Actions 는 **계정 잠금(카드 인증 실패)** 으로 못 씁니다. 대신 맥의 launchd 로 매일 돌립니다.
 
 ```bash
-npx wrangler login          # 한 번만 (원격 D1 인증)
-./scripts/setup-mac.sh      # API 키(키체인) + 백필 큐 + launchd 등록
+./scripts/setup-mac.sh      # 국토부 API 키 + Cloudflare API 토큰(키체인) + 백필 큐 + launchd
 ```
+
+> **인증은 API 토큰**을 쓴다(키체인 `zipsignal-cf-token`). `wrangler login`(OAuth)은
+> 토큰이 만료돼 launchd 무인 실행이 `code:7403` 로 죽는다 — 실제로 2026-07-15 에 겪음.
+>
+> **토큰 발급** ([dash → API Tokens](https://dash.cloudflare.com/profile/api-tokens) → Create Custom Token):
+> - 권한: **Account · D1 · Edit**
+> - **Account Resources: 이 계정 하나로 한정** (기본 "All accounts" 면 다른 프로젝트 D1 까지 편집 가능 → 반드시 좁힐 것). 잘못된 계정을 고르면 `code:7403`.
+> - 개인 랩탑 + Public 저장소라 **만료일(TTL)** 과 가능하면 **IP 제한**을 걸어 유출 시 피해를 줄인다.
+> - 토큰이 노출되면(로그·화면 공유 등) 즉시 dashboard 에서 **Roll(재발급)**.
+>
+> ⚠️ 키체인 항목은 CLI 로 만들면 앱 ACL 이 없어 같은 사용자의 아무 프로세스나 프롬프트 없이 읽는다.
+> 만료일·IP 제한이 그나마의 보완책이다.
 
 매일 07:30 에 [scripts/daily.sh](scripts/daily.sh) 가 두 가지를 합니다.
 

@@ -85,9 +85,13 @@ const activeSources = SOURCES.filter((s) => !sourceIds || sourceIds.has(s.id));
 
 const parser = new XMLParser({ ignoreAttributes: true, trimValues: true });
 
-// 로그에 API 키가 새지 않도록 마스킹 (에러 메시지에 요청 URL이 섞일 수 있음)
+// 로그에 비밀값이 새지 않도록 마스킹 (에러 메시지에 요청 URL·wrangler stderr 가 섞일 수 있음).
+// 로그 파일은 world-readable 이고 이 저장소는 Public 이라 방어적으로 전부 가린다.
+const SECRETS = [API_KEY, process.env.CLOUDFLARE_API_TOKEN].filter(Boolean);
 function redact(msg) {
-  return String(msg).split(API_KEY).join("***");
+  let out = String(msg);
+  for (const secret of SECRETS) out = out.split(secret).join("***");
+  return out;
 }
 
 // ---------- 유틸 ----------
